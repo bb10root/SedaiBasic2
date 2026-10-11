@@ -8457,11 +8457,12 @@ end;
 //     <hex start> <hex size> <name>
 // in the same shape a perf map uses, so the file stays useful if perf ever is available.
 //
-// AOT_MAP=1 writes $SEDAI_TMP/sb-aot-<pid>.map; AOT_MAP=<path> writes there instead. Off by default:
-// it costs a file per run and says nothing to anyone not holding a sampler.
-// ⛔ SEDAI_TMP, and it falls back to $HOME/tmp, not to /tmp (18 Sep 2026, owner): a reboot empties
-// /tmp, and a map lost that way is a measurement that has to be taken again. Only a machine with
-// neither variable set writes to /tmp.
+// AOT_MAP=1 writes $HOME/tmp/sedaibasic2/sb-aot-<pid>.map; AOT_MAP=<path> writes there instead. Off by
+// default: it costs a file per run and says nothing to anyone not holding a sampler.
+// ⛔ Not /tmp (18 Sep 2026, owner): a reboot empties /tmp, and a map lost that way is a measurement that has
+// to be taken again. ⛔ And not an inherited SEDAI_TMP either (10 Oct 2026, owner): $HOME/tmp is shared with
+// other projects' sessions, and a variable another session exports would send the map into their folder.
+// Only a machine with no HOME writes to /tmp.
 procedure AotWriteMapLine(const Name: string; Base: Pointer; Size: PtrUInt);
 var
   Where, Base_: string;
@@ -8471,12 +8472,8 @@ begin
   if Where = '' then Exit;
   if Where = '1' then
   begin
-    Base_ := GetEnvironmentVariable('SEDAI_TMP');
-    if Base_ = '' then
-    begin
-      Base_ := GetEnvironmentVariable('HOME');
-      if Base_ <> '' then Base_ := Base_ + '/tmp';
-    end;
+    Base_ := GetEnvironmentVariable('HOME');
+    if Base_ <> '' then Base_ := Base_ + '/tmp/sedaibasic2';
     if Base_ = '' then Base_ := '/tmp';
     ForceDirectories(Base_);
     Where := Format('%s/sb-aot-%d.map', [Base_, GetProcessID]);

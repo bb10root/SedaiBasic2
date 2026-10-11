@@ -3792,7 +3792,12 @@ begin
   // FreeBASIC "Input ; "prompt", v": the ';' right after INPUT keeps the cursor on the line once the answer is typed
   // (manual console/input2.bas). Headless there is no echo to keep, so it is consumed; left in place, the whole
   // statement was the separator and the variables were read as other statements (DIVERGENZE 646).
-  if FModernMode and Context.Check(ttSeparOutput) then Context.Advance;
+  // ⭐ DIVERGENZE 415: on a terminal it does keep it - NOLF.
+  if FModernMode and Context.Check(ttSeparOutput) then
+  begin
+    Context.Advance;
+    Result.Attributes.Values['NOLF'] := '1';
+  end;
   while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
   begin
     // Parse expression (prompt string or variable)
@@ -8590,7 +8595,11 @@ begin
     if Assigned(Param) then
       Result.AddChild(Param);
     if Context.Match(ttSeparParam) then
-      ParseExpression.Free;                           // wakeup flag: discard, as below
+    begin
+      Param := ParseExpression;                       // wakeup flag: kept, as below
+      if Assigned(Param) then
+        Result.AddChild(Param);
+    end;
     Context.Match(ttDelimParClose);
   end
   // Parse optional parameter (milliseconds to sleep)
@@ -8600,10 +8609,13 @@ begin
     if Assigned(Param) then
       Result.AddChild(Param);
     // FreeBASIC "Sleep milliseconds, wakeup": the optional second argument (1 = do not wake on a
-    // keypress) is consumed and ignored — the headless VM has no interactive wake anyway. Without this it
-    // was left as a stray ", literal" statement (a benign but noisy "Unhandled node type" warning).
+    // keypress) is child 1. It means something since DIVERGENZE 415: on a terminal SLEEP wakes on a key.
     if Context.Match(ttSeparParam) then
-      ParseExpression.Free;   // wakeup flag: discard
+    begin
+      Param := ParseExpression;
+      if Assigned(Param) then
+        Result.AddChild(Param);
+    end;
   end;
 
   DoNodeCreated(Result);
@@ -11174,7 +11186,11 @@ begin
     // Console "LINE INPUT [;] [prompt ;|,] var" — read a whole line into a string variable. Reuses the
     // console string-input path (antInput); v1 shows INPUT's "? " prompt.
     Result := TASTNode.Create(antInput, Tok);
-    if Context.Check(ttSeparOutput) then Context.Advance;   // optional leading ';'
+    if Context.Check(ttSeparOutput) then
+    begin
+      Context.Advance;   // optional leading ';': no new line once the answer is typed (NOLF, DIVERGENZE 415)
+      Result.Attributes.Values['NOLF'] := '1';
+    end;
     // Optional prompt string followed by ';' or ',' then the variable.
     if Context.Check(ttStringLiteral) and Assigned(Context.PeekNext) and
        ((Context.PeekNext.TokenType = ttSeparOutput) or (Context.PeekNext.TokenType = ttSeparParam)) then

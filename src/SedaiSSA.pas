@@ -577,6 +577,7 @@ type
     FRawBitUnit, FRawBitOfs: TInt64Array; // ...the unit size and bit offset of each bit field in the LAST UDTCLayoutRaw walk
     FRecNativeDefaults: Boolean;         // phase 3 (exclusions): a type with field DEFAULTS can be native
     FRecNativeRecArrays: Boolean;        // phase 3 (exclusions): an inline array of native records
+    FRecNativeStrArrays: Boolean;        // phase 5.4 (DIVERGENZE 684): ...whose elements hold String fields
     FRecNativeZStr: Boolean;             // phase 3 (exclusions): a ZString * n field outside a union
     FRecNativeFixStr: Boolean;           // phase 3 (exclusions): a String * n field
     FRecNativeStr: Boolean;              // phase 5.3: a variable-length String field is an FBSTRING descriptor in the image
@@ -769,6 +770,7 @@ type
     procedure CollectDeclaredNames(Node: TASTNode);  // Pre-scan AST for names an explicit declaration introduces
     function IsDeclaredName(const VarName: string): Boolean;
     function BuiltinRetiredByUndef(Node: TASTNode; const NameU: string): Boolean;  // 543 (2)
+    function NativeFieldAddrOfs(MemberNode: TASTNode; out Ofs: Int64): Boolean;   // 684: @obj.f of a native record
     function AddrOfRawUDTField(E: TASTNode): Boolean;   // "@x->f", x over C's memory (377)
     procedure WrapStaticMethodAddresses(AST: TASTNode);   // "@T.staticMethod" without THIS (661)
     function ModuleRecordVarDeclared(const NameU: string): Boolean;   // a module-scope Dim'd record of that name (655)
@@ -992,6 +994,8 @@ type
     function IsVarLenStrField(UDTIdx, FieldIdx: Integer): Boolean;               // phase 5.3: a variable-length String field
     procedure CollectNativeStrOffsets(UDTIdx: Integer; Base: Int64; var Offs: TInt64Array; Depth: Integer = 0);
     function NativeTypeHasStrings(const TypeName: string): Boolean;              // phase 5.3: a descriptor anywhere in the image
+    function StrOnlyBlockManaged(const TypeName: string): Boolean;               // phase 5.4: managed for its Strings alone
+    function RawStrRecordShape(const TypeName: string; out Size, Align: Int64): Boolean;   // phase 5.4: its C image
     function TypeHeldInArrayMember(const TypeName: string): Boolean;             // phase 5.3: some type has "m(..) As T"
     procedure EmitNativeStrFieldsClear(const Addr: TSSAValue; UDTIdx: Integer);  // phase 5.3: the implicit destructor
     function NativeStrFieldAddr(const Handle: TSSAValue; UDTIdx, FieldIdx: Integer; out Addr: TSSAValue): Boolean;
@@ -2105,6 +2109,7 @@ begin
   FRecNativeBits := GetEnvironmentVariable('SB_RECNATIVE_BITS') <> '0';                 // phase 3 exclusions: =0 is the A/B
   FRecNativeDefaults := GetEnvironmentVariable('SB_RECNATIVE_DEFAULTS') <> '0';         // phase 3 exclusions: =0 is the A/B
   FRecNativeRecArrays := GetEnvironmentVariable('SB_RECNATIVE_RECARRAYS') <> '0';     // phase 3 exclusions: =0 is the A/B
+  FRecNativeStrArrays := GetEnvironmentVariable('SB_RECNATIVE_STRARR') <> '0';       // phase 5.4, DIVERGENZE 684: =0 is the A/B
   // ⭐ ON by default since the managed string paths learned the address (17 set 2026): the aggregate initialiser
   // (EmitNativeFieldInit) and fb_memcopy into a field (the raw block copy). =0 is the A/B.
   FRecNativeZStr := GetEnvironmentVariable('SB_RECNATIVE_ZSTR') <> '0';
@@ -3148,6 +3153,32 @@ begin
   else Result := 0;
 end;
 
+function TSSAGenerator.NativeFieldAddrOfs(MemberNode: TASTNode; out Ofs: Int64): Boolean;
+// ⭐ DIVERGENZE 684: "@obj.field" where obj is a NATIVE record that the raw resolver does not reach (an element of a member
+// array, "@h.a(2).s") - the object is an address, so the field's is that address plus the field's C offset. ONE question for
+// the two readers that have to agree: EmitFieldAddress, which emits it, and IsFieldAddrExpr, which otherwise stamps a
+// record-field pointer's width code into it (the bytes then read at the wrong place). SB_FIELDADDR_NATIVE=0 is the A/B.
+var
+  TypeName: string;
+  U, FI: Integer;
+  Lay: TInt64Array;
+  Tot: Int64;
+begin
+  Result := False; Ofs := 0;
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  if not (FRecNativeKnob and FNativeMemory) then Exit;
+  if GetEnvironmentVariable('SB_FIELDADDR_NATIVE') = '0' then Exit;
+  TypeName := ObjectTypeName(MemberNode.GetChild(0));
+  if TypeName = '' then Exit;
+  U := FindUDT(TypeName);
+  if (U < 0) or not NativeRecordType(FUDTs[U].Name) then Exit;
+  FI := UDTFieldIndex(U, VarToStr(MemberNode.Value));
+  if (FI < 0) or FUDTs[U].Fields[FI].IsArray or (FUDTs[U].Fields[FI].NestedType <> '') then Exit;
+  if (not UDTCLayoutRaw(U, Lay, Tot)) or (FI > High(Lay)) then Exit;
+  Ofs := Lay[FI];
+  Result := True;
+end;
+
 function TSSAGenerator.IsFieldAddrExpr(Node: TASTNode): Boolean;
 // Is this expression "@obj.field" over a MANAGED record - the one shape that produces a RECORD-FIELD
 // pointer at a place the compiler can see it? Parentheses and pointer CASTS are transparent: a cast
@@ -3174,6 +3205,7 @@ begin
           (Node.GetChild(0).NodeType = antMemberAccess)) then Exit;
   if ResolveRawUDTBase(Node.GetChild(0).GetChild(0), TypeName, UDTIdx, Offsets, TotalSize,
                        BaseNode, IdxNode, ChainNode) then Exit;      // raw base: a byte address
+  if NativeFieldAddrOfs(Node.GetChild(0), TotalSize) then Exit;     // a native object's field: a byte address (684)
   Result := True;
 end;
 
@@ -8798,8 +8830,13 @@ begin
         begin
           // "Locate( [row] [, col] )" (DIVERGENZE 646): move as the statement does, then answer where the cursor IS -
           // column in the low byte, row in the next, the visibility bit 16 (the cursor is shown) - as fbc on a terminal.
+          // ⭐ DIVERGENZE 415: with no argument too - libfb's Locate(0, 0) asks the terminal and moves there.
           if (ArgListNode <> nil) and (ArgListNode.ChildCount > 0) then
-            EmitStatementFromArgs(antLocate, Node, ArgListNode);
+            EmitStatementFromArgs(antLocate, Node, ArgListNode)
+          else
+            EmitInstruction(ssaConLocate, MakeSSAValue(svkNone),
+                           EnsureIntRegister(MakeSSAConstInt(0)), EnsureIntRegister(MakeSSAConstInt(0)),
+                           MakeSSAValue(svkNone));
           LoPart := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaGraphicPos, LoPart, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           HiPart := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -8810,8 +8847,9 @@ begin
           EmitInstruction(ssaShl, RVal, HiPart, ShiftAmt, MakeSSAValue(svkNone));
           ArgReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaBitwiseOr, ArgReg, LoPart, RVal, MakeSSAValue(svkNone));
+          // the visibility bit: $10000 while the cursor is shown - LOCATE's third argument hides it on a terminal
           ShiftAmt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          EmitInstruction(ssaLoadConstInt, ShiftAmt, MakeSSAConstInt($10000), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          EmitInstruction(ssaGfxForeColor, ShiftAmt, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAConstInt(4));
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
           EmitInstruction(ssaBitwiseOr, Result, ArgReg, ShiftAmt, MakeSSAValue(svkNone));
@@ -14239,6 +14277,16 @@ begin
                  MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
+// The Immediate of an INPUT: its code in the low 32 bits and, with the marker $100 in bits 40..63, the flags in bits 32..39
+// (TBytecodeVM.InputCode / InputFlags read it). No flags: the code alone, exactly as it always was - CLASSIC, and old .basc.
+function InputImm(Code: Int64; Flags: Integer): TSSAValue;
+begin
+  if Flags = 0 then
+    Result := MakeSSAConstInt(Code)
+  else
+    Result := MakeSSAConstInt((Int64($100 or Flags) shl 32) or (Code and $FFFFFFFF));
+end;
+
 procedure TSSAGenerator.ProcessInput(Node: TASTNode);
 var
   i: Integer;
@@ -14258,6 +14306,9 @@ var
   TmpName: string;
   StoreNode: TASTNode;
   InImm: Int64;
+  NoPromptFirst: Boolean;   // the first INPUT of a MODERN statement with no prompt (DIVERGENZE 415)
+  PromptSep: string;        // the separator after the prompt: ';' writes "? ", ',' does not
+  InFlags: Integer;         // what the first INPUT writes around its line (see TBytecodeVM.FConInFlags)
   PromptIdx: Integer;  // the child that is a prompt EXPRESSION, -1 when the prompt is a literal or absent
 begin
   // INPUT has structure: optional prompt string, separator, variable names
@@ -14289,14 +14340,22 @@ begin
 
   // Scan children to find prompt (if any) and all destinations
   PromptIdx := StrToIntDef(Node.Attributes.Values['PROMPTIDX'], -1);
+  PromptSep := '';
+  if (PromptIdx >= 0) and (PromptIdx + 1 < Node.ChildCount) and
+     (Node.GetChild(PromptIdx + 1).NodeType = antSeparator) then
+    PromptSep := VarToStr(Node.GetChild(PromptIdx + 1).Value);
   for i := 0 to Node.ChildCount - 1 do
   begin
     Child := Node.GetChild(i);
     if (Child = MaxLenNode) or (i = PromptIdx) then Continue;
     case Child.NodeType of
       antLiteral:
-        // This is the prompt string
-        PromptStr := VarToStr(Child.Value);
+        begin
+          // This is the prompt string
+          PromptStr := VarToStr(Child.Value);
+          if (i + 1 < Node.ChildCount) and (Node.GetChild(i + 1).NodeType = antSeparator) then
+            PromptSep := VarToStr(Node.GetChild(i + 1).Value);
+        end;
       antSeparator:
         // Skip separators
         Continue;
@@ -14332,6 +14391,22 @@ begin
   end
   else
     PromptReg := MakeSSAValue(svkNone);
+
+  // ⭐ DIVERGENZE 415 - what fbc writes around the line, measured on a terminal: "? " after a prompt followed by ';'
+  // and not after one followed by ','; with no prompt "? " for INPUT and nothing for LINE INPUT; and a leading ';'
+  // keeps the cursor on the line once Enter is pressed. Carried by the first INPUT, MODERN only (see InputCode).
+  InFlags := 0;
+  if FModernMode then
+  begin
+    InFlags := 2;
+    if PromptReg.Kind <> svkNone then
+    begin
+      if PromptSep = ';' then InFlags := InFlags or 4;
+    end
+    else if not IsLine then
+      InFlags := InFlags or 4;
+    if Node.Attributes.Values['NOLF'] = '1' then InFlags := InFlags or 1;
+  end;
 
   // Process each variable
   for i := 0 to VarCount - 1 do
@@ -14380,29 +14455,46 @@ begin
     // Emit INPUT instruction based on variable type
     // Src1 contains the prompt register (for retry support), only for FIRST variable
     // The INPUT instruction itself will print prompt + "? "
+    // ⛔ "No prompt" is NOT "the prompt in register 0" (DIVERGENZE 415, found at a terminal): Immediate -1
+    // told the VM to print the prompt register, and with no prompt that was R0 - whatever string the
+    // program had left there ("Input "name"; a : Input n" printed the name again before "? "). In MODERN
+    // the first INPUT names a prompt only when it has one; CLASSIC keeps its encoding (sbv's dialect).
+    NoPromptFirst := (i = 0) and FModernMode and (PromptReg.Kind = svkNone);
     case VarReg.RegType of
       srtInt:
-        if i = 0 then
+        if NoPromptFirst then
+          EmitInstruction(ssaInputInt, VarReg, MakeSSAValue(svkNone),
+                         MakeSSAValue(svkNone), InputImm(0, InFlags))
+        else if i = 0 then
           EmitInstruction(ssaInputInt, VarReg, PromptReg,
-                         MakeSSAValue(svkNone), MakeSSAConstInt(-1))
+                         MakeSSAValue(svkNone), InputImm(-1, InFlags))
         else
           EmitInstruction(ssaInputInt, VarReg, MakeSSAValue(svkNone),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       srtFloat:
-        if i = 0 then
+        if NoPromptFirst then
+          EmitInstruction(ssaInputFloat, VarReg, MakeSSAValue(svkNone),
+                         MakeSSAValue(svkNone), InputImm(0, InFlags))
+        else if i = 0 then
           EmitInstruction(ssaInputFloat, VarReg, PromptReg,
-                         MakeSSAValue(svkNone), MakeSSAConstInt(-1))
+                         MakeSSAValue(svkNone), InputImm(-1, InFlags))
         else
           EmitInstruction(ssaInputFloat, VarReg, MakeSSAValue(svkNone),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       srtString:
         begin
           // Immediate: -1 prompt + field, -2 prompt + whole LINE, 2 whole line without the prompt marker
-          if i = 0 then
+          if NoPromptFirst and IsLine then
+            EmitInstruction(ssaInputString, VarReg, MakeSSAValue(svkNone),
+                           MakeSSAValue(svkNone), InputImm(INPUT_LINE, InFlags))
+          else if NoPromptFirst then
+            EmitInstruction(ssaInputString, VarReg, MakeSSAValue(svkNone),
+                           MakeSSAValue(svkNone), InputImm(0, InFlags))
+          else if i = 0 then
           begin
             if IsLine then InImm := INPUT_LINE_PROMPT else InImm := -1;
             EmitInstruction(ssaInputString, VarReg, PromptReg,
-                           MakeSSAValue(svkNone), MakeSSAConstInt(InImm));
+                           MakeSSAValue(svkNone), InputImm(InImm, InFlags));
           end
           else if IsLine then
             EmitInstruction(ssaInputString, VarReg, MakeSSAValue(svkNone),
@@ -19782,6 +19874,8 @@ function TSSAGenerator.FbStrDescAddr(SNode: TASTNode; out Addr: TSSAValue): Bool
 var
   idx, ai, U, F: Integer;
   TName: string;
+  Ofs: Int64;
+  H: TSSAValue;
 begin
   Result := False;
   Addr := MakeSSAValue(svkNone);
@@ -19815,6 +19909,18 @@ begin
     F := UDTFieldIndex(U, VarToStr(SNode.Value));
     if (F < 0) or not IsVarLenStrField(U, F) or not NativeRecordType(FUDTs[U].Name) then Exit;
     Result := TryRawUDTFieldAddress(SNode, Addr);
+    // ⭐ DIVERGENZE 684: ...and when the raw resolver does not reach the object (an element of a member array), the object's
+    // address plus the field's offset - "StrPtr(h.a(2).s)" answered a COPY, and C writing there wrote nothing.
+    if (not Result) and NativeFieldAddrOfs(SNode, Ofs) and ResolveRecordObject(SNode.GetChild(0), H, TName) then
+    begin
+      Addr := EnsureIntRegister(H);
+      if Ofs <> 0 then
+      begin
+        Addr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaAddInt, Addr, EnsureIntRegister(H), EnsureIntRegister(MakeSSAConstInt(Ofs)), MakeSSAValue(svkNone));
+      end;
+      Result := True;
+    end;
   end;
 end;
 
@@ -24215,7 +24321,12 @@ begin
   // CLASSIC (C128 v7): "LOCATE x, y" positions the bit-map PIXEL cursor.
   // MODERN (FreeBASIC): "LOCATE row, column" positions the TEXT cursor, 1-based, on the console.
   // Child 0 is x in one reading and row in the other -- the operand order is the same, the meaning is not.
-  if FModernMode then
+  // ⭐ DIVERGENZE 415: in MODERN the cursor flag reaches the VM (Src3 -> Dest, read): on an initialised
+  // terminal it shows or hides the cursor, as libfb's LOCATE does.
+  if FModernMode and (Node.ChildCount >= 3) and (Node.GetChild(2) <> nil) then
+    EmitInstruction(ssaConLocate, MakeSSAValue(svkNone),
+                   EnsureIntRegister(XReg), EnsureIntRegister(YReg), EnsureIntRegister(CursorVal))
+  else if FModernMode then
     EmitInstruction(ssaConLocate, MakeSSAValue(svkNone),
                    EnsureIntRegister(XReg), EnsureIntRegister(YReg), MakeSSAValue(svkNone))
   else
@@ -29035,7 +29146,8 @@ begin
   // member into a hidden array of scalars and keeps refusing, as before.
   if (F.ArrayElemPtrPointee <> '') and not AllowRecordElems then Exit;
   if (F.ArrayElemType <> '') and
-     not (AllowRecordElems and NestedMemberShape(F.ArrayElemType, False, NSz, NAl) and (NSz > 0)) then Exit;
+     not (AllowRecordElems and (NestedMemberShape(F.ArrayElemType, False, NSz, NAl) or
+                                RawStrRecordShape(F.ArrayElemType, NSz, NAl)) and (NSz > 0)) then Exit;
   D := F.ArrayBounds.GetChild(0);
   Lb := 0;
   if D.NodeType = antDimRange then
@@ -32162,7 +32274,7 @@ function TSSAGenerator.EmitBinGetToLValue(const HandleReg: TSSAValue; Target: TA
 var
   Bank: TSSARegisterType;
   TmpName: string;
-  TmpReg: TSSAValue;
+  TmpReg, Pre: TSSAValue;
   Assign, Ident: TASTNode;
 begin
   Result := False;
@@ -32176,9 +32288,20 @@ begin
       EmitInstruction(ssaGetBinFloat, TmpReg, HandleReg, MakeSSAValue(svkNone),
                       MakeSSAConstInt(BinaryElemBytesOfNode(Target)));
     srtString:
-      // A string target keeps the variable-length rule ("read Len(s) bytes"); the fixed-length
-      // capacities live on the DECLARATION, which a non-bare target does not carry here.
-      EmitInstruction(ssaGetBinStr, TmpReg, HandleReg, MakeSSAValue(svkNone), MakeSSAConstInt(0));
+      begin
+        // A string target keeps the variable-length rule ("read Len(s) bytes"); the fixed-length
+        // capacities live on the DECLARATION, which a non-bare target does not carry here.
+        // ⛔ "Len(s)" is the TARGET's length, and width 0 asks it of the register it reads into - this fresh temporary,
+        // which is empty: "Get #f, , r.s" read zero bytes and stored "" over the field (DIVERGENZE 670). The temporary
+        // starts as a copy of the target, so the read takes as many bytes as the field holds, as under fbc.
+        // SB_GETBIN_PRELOAD=0 is the A/B.
+        if GetEnvironmentVariable('SB_GETBIN_PRELOAD') <> '0' then
+        begin
+          ProcessExpression(Target, Pre);
+          EmitInstruction(ssaCopyString, TmpReg, EnsureStringRegister(Pre), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+        EmitInstruction(ssaGetBinStr, TmpReg, HandleReg, MakeSSAValue(svkNone), MakeSSAConstInt(0));
+      end;
   else
     EmitInstruction(ssaGetBinInt, TmpReg, HandleReg, MakeSSAValue(svkNone),
                     MakeSSAConstInt(BinaryElemBytesOfNode(Target)));
@@ -33527,6 +33650,10 @@ begin
     Txt := Copy(Txt, Pos('|', Txt) + 1, MaxInt);
     Exit(PrintKindOfTypeName(Copy(Txt, 1, Pos('|', Txt) - 1)));
   end;
+  // ⭐ DIVERGENZE 682 - fbc's Screen(row, col [, colorflag]) returns a ULONG, so it prints without the sign column:
+  // "Print Screen(1, 1)" is "81" under fbc, and was " 81" here.
+  if FModernMode and (Node.NodeType = antGraphicsFunction) and (Node.ValueUpper = kSCREENGFX) then
+    Exit(3);
   case Node.NodeType of
     antIdentifier:
       begin
@@ -36817,7 +36944,12 @@ begin
   U := FindUDT(TypeName);
   if U < 0 then Exit;
   FI := UDTFieldIndex(U, VarToStr(MemberNode.Value));
-  if (FI < 0) or not FUDTs[U].Fields[FI].InlineArray or (FUDTs[U].Fields[FI].ArrayElemType = '') then Exit;
+  if (FI < 0) or (FUDTs[U].Fields[FI].ArrayElemType = '') then Exit;
+  // ⭐ Phase 5.4 (DIVERGENZE 684): an array of records with String fields is never in the MANAGED bytes, but in a native
+  // container it is in the C image all the same (RawStrRecordShape) - the raw element address reaches it.
+  if not (FUDTs[U].Fields[FI].InlineArray or
+          (FRecNativeStrArrays and FRecNativeKnob and FNativeMemory and NativeRecordType(FUDTs[U].Name) and
+           StrOnlyBlockManaged(FUDTs[U].Fields[FI].ArrayElemType))) then Exit;
   Result := FindUDT(FUDTs[U].Fields[FI].ArrayElemType);
 end;
 
@@ -43866,10 +43998,60 @@ function TSSAGenerator.NativeTypeHasStrings(const TypeName: string): Boolean;
       if IsVarLenStrField(U, i) then Exit(True);
       if (not FUDTs[U].Fields[i].IsArray) and (FUDTs[U].Fields[i].NestedType <> '') and
          Rec(FindUDT(UpperFast(FUDTs[U].Fields[i].NestedType)), Depth + 1) then Exit(True);
+      // ⭐ Phase 5.4 (DIVERGENZE 684): ...and an INLINE array of such records - its elements are images in this one.
+      if FRecNativeStrArrays and FUDTs[U].Fields[i].IsArray and
+         (FUDTs[U].Fields[i].ArrayElemType <> '') and
+         Rec(FindUDT(UpperFast(FUDTs[U].Fields[i].ArrayElemType)), Depth + 1) then Exit(True);
     end;
   end;
 begin
   Result := NativeStrFieldsOn and Rec(FindUDT(UpperFast(TypeName)), 0);
+end;
+
+function TSSAGenerator.RawStrRecordShape(const TypeName: string; out Size, Align: Int64): Boolean;
+// Phase 5.4 (DIVERGENZE 684): the C image of a record with String fields, as the element of an inline array member. The
+// managed shape declines it (a String has no bytes there); the raw one is fbc's - each descriptor 24 bytes in place -
+// and the reported shape must agree with it, or it is not offered.
+var
+  U: Integer;
+  Offs: TInt64Array;
+  Tot, RSz, RAl: Int64;
+begin
+  Result := False; Size := 0; Align := 1;
+  if not (FRecNativeStrArrays and NativeTypeHasStrings(TypeName)) then Exit;
+  U := FindUDT(UpperFast(TypeName));
+  if (U < 0) or not UDTCLayoutRaw(U, Offs, Tot) then Exit;
+  if (not NestedMemberShape(TypeName, True, RSz, RAl)) or (RSz <> Tot) then Exit;
+  Size := Tot; Align := RAl;
+  Result := Size > 0;
+end;
+
+function TSSAGenerator.StrOnlyBlockManaged(const TypeName: string): Boolean;
+// Phase 5.4 (DIVERGENZE 684): is TypeName's block managed ONLY because it holds String descriptors - no constructor or
+// destructor to run, no field initialiser, a C image? Such a type can be the element of an INLINE array member of a
+// native record: its implicit copy and destructor are the descriptor walk (CollectNativeStrOffsets, EmitDestructorCall),
+// which visits every element.
+var
+  T: string;
+  Idx, Guard: Integer;
+  Offsets: TInt64Array;
+  Total: Int64;
+begin
+  Result := False;
+  if not (FRecNativeStrArrays and NativeTypeHasStrings(TypeName)) then Exit;
+  T := UpperFast(TypeName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    if FBlockManagedTypes.IndexOf(T) >= 0 then Exit;
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    T := UpperFast(FUDTs[Idx].Parent);
+    Inc(Guard);
+  end;
+  Idx := FindUDT(UpperFast(TypeName));
+  if (Idx < 0) or (not UDTCLayoutRaw(Idx, Offsets, Total)) or TypeHasFieldDefaults(Idx, 0) then Exit;
+  Result := True;
 end;
 
 function TSSAGenerator.TypeHeldInArrayMember(const TypeName: string): Boolean;
@@ -43884,7 +44066,11 @@ function TSSAGenerator.TypeHeldInArrayMember(const TypeName: string): Boolean;
       for i := 0 to High(FUDTs[k].Fields) do
         with FUDTs[k].Fields[i] do
         begin
-          if IsArray and SameText(ArrayElemType, T) then Exit(True);
+          // ⭐ Phase 5.4 (DIVERGENZE 684): an INLINE array member of a NATIVE holder is images in the holder's image, copied
+          // and destroyed element by element - it does not hold the type the managed way. (Asked while TypeName is on the
+          // asking chain, so the holder's answer assumes TypeName native: the two are native together or not at all.)
+          if IsArray and SameText(ArrayElemType, T) and
+             not (FRecNativeStrArrays and NativeRecordType(FUDTs[k].Name)) then Exit(True);
           if (not IsArray) and SameText(NestedType, T) and Held(FUDTs[k].Name, Depth + 1) then Exit(True);
         end;
   end;
@@ -43895,9 +44081,9 @@ end;
 procedure TSSAGenerator.CollectNativeStrOffsets(UDTIdx: Integer; Base: Int64; var Offs: TInt64Array; Depth: Integer);
 // The byte offsets of every FBSTRING descriptor in a native image, nested record members included (phase 5.3).
 var
-  Lay: TInt64Array;
-  Tot: Int64;
-  i: Integer;
+  Lay, Lbs, Ubs: TInt64Array;
+  Tot, EB, k: Int64;
+  i, EU: Integer;
 begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) or (Depth > 16) then Exit;
   if not UDTCLayoutRaw(UDTIdx, Lay, Tot) then Exit;
@@ -43910,7 +44096,20 @@ begin
       Offs[High(Offs)] := Base + Lay[i];
     end
     else if (not FUDTs[UDTIdx].Fields[i].IsArray) and (FUDTs[UDTIdx].Fields[i].NestedType <> '') then
-      CollectNativeStrOffsets(FindUDT(UpperFast(FUDTs[UDTIdx].Fields[i].NestedType)), Base + Lay[i], Offs, Depth + 1);
+      CollectNativeStrOffsets(FindUDT(UpperFast(FUDTs[UDTIdx].Fields[i].NestedType)), Base + Lay[i], Offs, Depth + 1)
+    // ⭐ Phase 5.4 (DIVERGENZE 684): ...and every element of an inline array of such records.
+    else if FRecNativeStrArrays and FUDTs[UDTIdx].Fields[i].IsArray and
+            (FUDTs[UDTIdx].Fields[i].ArrayElemType <> '') and
+            NativeTypeHasStrings(FUDTs[UDTIdx].Fields[i].ArrayElemType) then
+    begin
+      EU := FindUDT(UpperFast(FUDTs[UDTIdx].Fields[i].ArrayElemType));
+      if (EU >= 0) and (InlineArrayDims(UDTIdx, i, Lbs, Ubs) = 1) then
+      begin
+        EB := NativeImageBytes(EU);
+        for k := 0 to Ubs[0] - Lbs[0] do
+          CollectNativeStrOffsets(EU, Base + Lay[i] + k * EB, Offs, Depth + 1);
+      end;
+    end;
   end;
 end;
 
@@ -44088,7 +44287,7 @@ begin
   // ⛔ Phase 5.3: a type with String fields that some type holds in an ARRAY MEMBER stays managed - the member's elements
   // are copied by bytes (ArrayCopyRecords) and are not destroyed with their container, so the descriptors would be shared
   // and leak (m331). Teaching those two roads is the rest of 5.4.
-  if NativeTypeHasStrings(T) and TypeHeldInArrayMember(T) then Exit(No('String fields, held in an array member'));
+  // (phase 5.4: asked at the END, once T is on the asking chain - the holder's answer depends on T's.)
   // ⛔ ...and every BIT FIELD must have been placed by that walk (FRawBitUnit), or the raw path would read it at bit 0:
   // a shape the walk does not record stays managed (phase 3; the whole-type union was one, udt/type3 of the manual).
   for i := 0 to High(FUDTs[Idx].Fields) do
@@ -44126,10 +44325,14 @@ begin
         // bytes: C's bytes all the same, and the raw path indexes it (RawMemberArrayElemAddr).
         if IsArray and not (
              // phase 3: an INLINE array of NATIVE records (glib's GValue.data, fbc's FBARRAY.dimTB) - its elements are C bytes
-             (FRecNativeRecArrays and (ArrayElemType <> '') and InlineArray and
+             // (phase 5.4: an array of records with String fields is never in the managed bytes - a String has none there -
+             // but its C image is fbc's, which is the one this path lays out: RawStrRecordShape)
+             (FRecNativeRecArrays and (ArrayElemType <> '') and (InlineArray or StrOnlyBlockManaged(ArrayElemType)) and
               (InlineArrayDims(Idx, i, Lbs, Ubs) = 1) and
-              (not UDTBlockIsManaged(ArrayElemType)) and NativeRecordType(ArrayElemType) and
-              not NativeTypeHasStrings(ArrayElemType)) or   // phase 5.3: no element-wise copy/destruction there yet
+              ((not UDTBlockIsManaged(ArrayElemType)) or StrOnlyBlockManaged(ArrayElemType)) and
+              NativeRecordType(ArrayElemType) and
+              // phase 5.3: no element-wise copy/destruction there - phase 5.4 (DIVERGENZE 684) walks the elements
+              ((not NativeTypeHasStrings(ArrayElemType)) or StrOnlyBlockManaged(ArrayElemType))) or
              ((ArrayElemType = '') and
                             (InlineArray or (FRecNativeProcFields and (ArrayElemPtrPointee <> '') and
                                              UDTFieldArrayShape(Idx, i, ACnt, AEB, True) and
@@ -44138,6 +44341,7 @@ begin
         if (PtrPointee <> '') and not NativeRecordType(PtrPointee) then Exit(No('pointer ' + Name + ' to ' + PtrPointee));
         if IsArray and (ArrayElemPtrPointee <> '') and not NativeRecordType(ArrayElemPtrPointee) then Exit(No('pointer array ' + Name));
       end;
+    if NativeTypeHasStrings(T) and TypeHeldInArrayMember(T) then Exit(No('String fields, held in an array member'));
     Result := True;
   finally
     FNativeRecAsking.Delete(FNativeRecAsking.IndexOf(T));
@@ -45381,8 +45585,10 @@ procedure TSSAGenerator.EmitDestructorCall(const HandleVal: TSSAValue; const Typ
 // even when TypeName has no destructor of its own, so that nested members with destructors still fire.
 var
   Lbl: string;
-  UDTIdx, i, Slot: Integer;
+  UDTIdx, i, Slot, EU: Integer;
   NestedHandle: TSSAValue;
+  Lay, Lbs, Ubs: TInt64Array;
+  Tot, EB, k: Int64;
 begin
   // OOP: the permission, on the DESTRUCTOR - the mirror of the constructor check, and reached by the
   // same six shapes plus "Delete p" and "Erase a".
@@ -45416,6 +45622,26 @@ begin
         Slot := FUDTs[UDTIdx].Fields[i].Slot;
         NestedHandle := NestedMemberHandle(HandleVal, UDTIdx, i);   // its handle, or its VIEW (226)
         EmitDestructorCall(NestedHandle, FUDTs[UDTIdx].Fields[i].NestedType);
+      end
+      // ⭐ Phase 5.4 (DIVERGENZE 684): ...and each element of an INLINE array of records with String fields, in a native
+      // image - last element first, as fbc destroys an array. Their descriptors were freed by nobody: the holder's own
+      // clear walks its own fields only.
+      else if FRecNativeStrArrays and FUDTs[UDTIdx].Fields[i].IsArray and
+              (FUDTs[UDTIdx].Fields[i].ArrayElemType <> '') and
+              NativeTypeHasStrings(FUDTs[UDTIdx].Fields[i].ArrayElemType) and
+              NativeRecordType(FUDTs[UDTIdx].Name) and UDTCLayoutRaw(UDTIdx, Lay, Tot) and (i <= High(Lay)) and
+              (InlineArrayDims(UDTIdx, i, Lbs, Ubs) = 1) then
+      begin
+        EU := FindUDT(UpperFast(FUDTs[UDTIdx].Fields[i].ArrayElemType));
+        if EU < 0 then Continue;
+        EB := NativeImageBytes(EU);
+        for k := Ubs[0] - Lbs[0] downto 0 do
+        begin
+          NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaAddInt, NestedHandle, EnsureIntRegister(HandleVal),
+                          EnsureIntRegister(MakeSSAConstInt(Lay[i] + k * EB)), MakeSSAValue(svkNone));
+          EmitDestructorCall(NestedHandle, FUDTs[EU].Name);
+        end;
       end;
 end;
 
@@ -54989,6 +55215,7 @@ procedure TSSAGenerator.EmitFieldAddress(MemberNode: TASTNode; out Result: TSSAV
 // record-field pointer (RECPTR_TAG | handle | slot) at runtime. The pointee bank is carried by the
 // pointer's declared type (FPointerVars), as for any other pointer.
 var
+  FATot: Int64;
   TypeName, NestedT: string;
   UDTIdx, Slot, FI: Integer;
   Bank: TSSARegisterType;
@@ -55027,6 +55254,20 @@ begin
   if (FI >= 0) and (FUDTs[UDTIdx].Fields[FI].NestedType <> '') and not FUDTs[UDTIdx].Fields[FI].IsArray then
   begin
     Result := NestedMemberHandle(HandleVal, UDTIdx, FI);
+    Exit;
+  end;
+  // ⭐ DIVERGENZE 684: ...and on a NATIVE record the object IS an address, so the field's is that address plus its C offset
+  // - for every road that reaches the object without the raw resolver (an element of a member array, "@h.a(2).s"). The
+  // slot pointer below named a managed slot on an image: "@h.a(2).s" answered the element's own address.
+  if NativeFieldAddrOfs(MemberNode, FATot) then
+  begin
+    Result := EnsureIntRegister(HandleVal);
+    if FATot <> 0 then
+    begin
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, Result, EnsureIntRegister(HandleVal), EnsureIntRegister(MakeSSAConstInt(FATot)),
+                      MakeSSAValue(svkNone));
+    end;
     Exit;
   end;
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -55176,7 +55417,15 @@ begin
     // and "gdk_pixbuf_get_pixels(pb)[k]" answered 0 (gdk-pixbuf deck).
     IsRaw := (RawPtrExprName(RawSrcNode) <> '') or IsStrDataPtrExpr(RawSrcNode) or
              IsRawElemArrayAccess(RawSrcNode) or (RawAddrFieldPointee(RawSrcNode) <> '') or
-             IsForeignPtrCall(RawSrcNode);
+             IsForeignPtrCall(RawSrcNode) or
+             // ...AND "Cast(Any Ptr, u) + n" WITH u A RAW UDT POINTER (an image, a C struct), indexed through an outer
+             // cast: "Cast(ULong Ptr, Cast(Any Ptr, img) + 32)[0]". RawPtrExprName does not answer it - its answer is a
+             // NAME, and u's element type would be the record's - so in strict the read took the managed road and read
+             // EIGHT bytes for a ULong (DIVERGENZE 676). The write hands the CAST itself as RawSrcNode, the read its
+             // operand: a pointer cast is passed through, as RawPtrExprName does. SB_CAST_RAWUDT_IDX=0 is the A/B.
+             ((GetEnvironmentVariable('SB_CAST_RAWUDT_IDX') <> '0') and
+              (RawUDTCastSum(RawSrcNode) or
+               ((RawSrcNode.NodeType = antCast) and (RawSrcNode.ChildCount >= 1) and RawUDTCastSum(RawSrcNode.GetChild(0)))));
     if IsRaw then
     begin
       Sz := RawElemSizeOfPointee(Pointee);
@@ -63529,6 +63778,7 @@ var
   i: Integer;
   PrevBlock, NewBlock: TSSABasicBlock;  // PHASE 3 TIER 3: CFG construction
   SecondsVal: TSSAValue;  // For SLEEP command
+  FlagVal, SleepFlag: TSSAValue;  // SLEEP n, 1: the "do not wake" flag (DIVERGENZE 415)
   EndCodeVal: TSSAValue;  // END <expr>: a computed exit code (DIVERGENZE 646)
   FPSReg: TSSAValue;  // For FRAME command
   ArgReg: TSSAValue;      // For SETDATE/SETTIME string argument
@@ -64157,7 +64407,30 @@ begin
             SecondsVal := FPSReg;
           end;
         end;
+        // "Sleep n, 1": do not wake on a key (DIVERGENZE 415). A constant flag only - fbc's argument is
+        // a flag, and a computed one is evaluated and read as "wake". Bit 40 of the constant, or Src3
+        // (which lands in Immediate) when the milliseconds are in a register.
+        SleepFlag := MakeSSAValue(svkNone);
+        if FModernMode and (Node.ChildCount > 1) then
+        begin
+          ProcessExpression(Node.GetChild(1), FlagVal);
+          if (FlagVal.Kind = svkConstInt) and (FlagVal.ConstInt = 1) then
+          begin
+            if SecondsVal.Kind = svkConstInt then
+              SecondsVal := MakeSSAConstInt(SecondsVal.ConstInt or (Int64(1) shl 40))
+            else if SecondsVal.Kind = svkConstFloat then
+              SecondsVal := MakeSSAConstInt(Trunc(SecondsVal.ConstFloat) or (Int64(1) shl 40))
+            else
+              SleepFlag := MakeSSAConstInt(Int64(1) shl 40);
+          end;
+        end;
         EmitInstruction(ssaSleep, MakeSSAValue(svkNone), SecondsVal,
+                       MakeSSAValue(svkNone), SleepFlag);
+      end
+      else if FModernMode then
+      begin
+        // a bare FreeBASIC "Sleep" waits for a key: -1 (DIVERGENZE 415); with no terminal, 1 ms as before
+        EmitInstruction(ssaSleep, MakeSSAValue(svkNone), MakeSSAConstInt(-1),
                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end
       else

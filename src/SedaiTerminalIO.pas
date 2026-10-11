@@ -107,6 +107,8 @@ type
     // The modelled screen (see FCells)
     procedure AllocCells;
     procedure ClearView;
+    function CellFg: Byte;   // the colours a cell written now takes (DIVERGENZE 415: on an initialised
+    function CellBg: Byte;   // terminal, the console's - libfb's attribute buffer)
     procedure ScrollCellsUp;
     procedure CellNextRow;
     procedure PutCells(const Text: string);
@@ -131,6 +133,7 @@ type
     procedure PrintLn(const Text: string; ClearBackground: Boolean = False);
     procedure NewLine;
     procedure Clear;
+    procedure ClearMode(Mode: Integer);   // -1 bare CLS, 0 whole screen, 1 nothing, 2 the print area
     procedure ResetPrintState;
     function IsScreenVisible: Boolean;
 
@@ -237,6 +240,7 @@ type
     FShouldQuit: Boolean;
     FShouldStop: Boolean;
     FPendingChar: Char;
+    FPendingTail: string;   // the rest of a key longer than a byte: Chr(255) + scan (DIVERGENZE 415)
     FHasPendingChar: Boolean;
     {$IFDEF WINDOWS}
     FConsoleHandle: THandle;
@@ -268,6 +272,8 @@ type
 // while a program's output may still be buffered MUST call this first, or its text jumps ahead of
 // text that was produced before it -- which is exactly what a runtime error message does.
 procedure TerminalOutFlush;
+// Write S through the stream PRINT uses and flush it: the terminal console's escape sequences (DIVERGENZE 415).
+procedure TerminalWriteRaw(const S: string);
 
 // The terminal controller behind an output device, or nil when the device is another one (the SDL2 console,
 // the web output) - and always nil off UNIX, where the WSTRING print keeps writing UTF-8 (DIVERGENZE 414: fbc
@@ -284,6 +290,9 @@ function FbConsoleInited: Boolean;
 function StdStreamIsTerminal(IsInput: Boolean): Boolean;
 
 implementation
+
+uses
+  SedaiTermConsole;   // the console on a terminal, as libfb has it (DIVERGENZE 415)
 
 var
   // SB_CELLROT=0 restores the cell-by-cell scroll of the modelled screen. Same state either way --
@@ -349,6 +358,14 @@ begin
   // ⛔ C's buffer too: Free Pascal ends the process without the C library's exit on the ordinary road, and what C
   // held for stdout would be lost with it (DIVERGENZE 434; the reverse order is DIVERGENZE 517's).
   CStdoutFlush;
+end;
+
+procedure OutWrite(const Text: string); forward;
+
+procedure TerminalWriteRaw(const S: string);
+begin
+  OutWrite(S);
+  TerminalOutFlush;
 end;
 
 procedure OutWrite(const Text: string);
@@ -627,17 +644,32 @@ begin
   ClearView;
 end;
 
+function TTerminalController.CellFg: Byte;
+// ⭐ On an initialised terminal a cell keeps the console colour it was written with, as libfb's attribute buffer
+// does, so Screen(r, c, 1) answers fbc's 7 for text printed in the starting colour (it answered the C128 source
+// default, 1). Elsewhere the model keeps the C128 colour sources.
+begin
+  if TcActive then Result := Byte(TcColorFg and $0F) else Result := FFgIdx;
+end;
+
+function TTerminalController.CellBg: Byte;
+begin
+  if TcActive then Result := Byte(TcColorBg and $0F) else Result := FBgIdx;
+end;
+
 procedure TTerminalController.ClearView;
 var
+  CFg, CBg: Byte;
   R, C: Integer;
 begin
   if Length(FCells) = 0 then Exit;
+  CFg := CellFg; CBg := CellBg;
   for R := FViewTop to FViewBottom do
     for C := FViewLeft to FViewRight do
     begin
       FCells[R][C].Ch := ' ';
-      FCells[R][C].Fg := FFgIdx;
-      FCells[R][C].Bg := FBgIdx;
+      FCells[R][C].Fg := CFg;
+      FCells[R][C].Bg := CBg;
     end;
   FCellX := FViewLeft;
   FCellY := FViewTop;
@@ -647,7 +679,9 @@ procedure TTerminalController.ScrollCellsUp;
 var
   R, C: Integer;
   Recycled: array of TTermCell;
+  CFg, CBg: Byte;
 begin
+  CFg := CellFg; CBg := CellBg;
   // A full-width print area is the normal case, and there the rows are separate dynamic arrays: the
   // scroll is a ROTATION OF ROW REFERENCES, with the old top row recycled as the new bottom one.
   // That is a handful of reference moves plus one row to blank, instead of copying every cell of the
@@ -665,8 +699,8 @@ begin
     for C := 0 to FCols - 1 do
     begin
       FCells[FViewBottom][C].Ch := ' ';
-      FCells[FViewBottom][C].Fg := FFgIdx;
-      FCells[FViewBottom][C].Bg := FBgIdx;
+      FCells[FViewBottom][C].Fg := CFg;
+      FCells[FViewBottom][C].Bg := CBg;
     end;
     Exit;
   end;
@@ -677,8 +711,8 @@ begin
   for C := FViewLeft to FViewRight do
   begin
     FCells[FViewBottom][C].Ch := ' ';
-    FCells[FViewBottom][C].Fg := FFgIdx;
-    FCells[FViewBottom][C].Bg := FBgIdx;
+    FCells[FViewBottom][C].Fg := CFg;
+    FCells[FViewBottom][C].Bg := CBg;
   end;
 end;
 
@@ -708,8 +742,8 @@ begin
   N := Length(Text);
   if N = 0 then Exit;
   Row := @FCells[FCellY][0];
-  Fg := FFgIdx;
-  Bg := FBgIdx;
+  Fg := CellFg;
+  Bg := CellBg;
   for i := 1 to N do
   begin
     Ch := Text[i];
@@ -783,7 +817,14 @@ end;
 
 procedure TTerminalController.Print(const Text: string; ClearBackground: Boolean);
 begin
-  OutWrite(Text);
+  if TcActive then
+  begin
+    // libfb on a terminal: control characters print as glyphs, and every PRINT reaches the screen at once
+    OutWrite(TcPrintText(Text));
+    TerminalOutFlush;
+  end
+  else
+    OutWrite(Text);
   PutCells(Text);
   MirrorTextToSurface(Text);
   Inc(FCursorX, Length(Text));
@@ -791,8 +832,13 @@ end;
 
 procedure TTerminalController.PrintLn(const Text: string; ClearBackground: Boolean);
 begin
-  OutWrite(Text);
-  OutWrite(LineEnding);
+  if TcActive then
+    OutWrite(TcPrintText(Text) + TcPrintText(LineEnding))
+  else
+  begin
+    OutWrite(Text);
+    OutWrite(LineEnding);
+  end;
   if GOutIsTerminal then TerminalOutFlush;   // line buffering while a human is watching
   PutCells(Text);
   MirrorTextToSurface(Text);
@@ -803,7 +849,7 @@ end;
 
 procedure TTerminalController.NewLine;
 begin
-  OutWrite(LineEnding);
+  if TcActive then OutWrite(TcPrintText(LineEnding)) else OutWrite(LineEnding);
   if GOutIsTerminal then TerminalOutFlush;
   CellNextRow;
   FCursorX := 0;
@@ -875,18 +921,33 @@ end;
 
 procedure TTerminalController.Clear;
 begin
+  ClearMode(0);
+end;
+
+procedure TTerminalController.ClearMode(Mode: Integer);
+begin
   // Only a real terminal gets the clear; a redirected stream gets nothing (see StdoutIsTerminal). The
   // MODELLED screen is cleared either way -- that is what CSRLIN/POS and the cell grid read back.
+  // ⭐ DIVERGENZE 415: in sb on Unix it is libfb's clear - line by line, and only once the console is
+  // initialised: with stdin redirected fbc writes nothing for CLS, and neither does sb. sbv, which never
+  // asks for fbc's console, and SB_TERMCONSOLE=0 keep the ANSI clear this always wrote.
+  {$IFDEF UNIX}
+  if TcActive then
+    TcClear(Mode, FViewTop + 1, FViewBottom + 1)
+  else if StdoutIsTerminal and not TcFbConsole then
+  begin
+    OutWrite(#27'[2J'#27'[H');  // ANSI clear + home
+    TerminalOutFlush;
+  end;
+  {$ELSE}
   if StdoutIsTerminal then
   begin
     // Through the same buffer as everything else, or the clear would overtake the text before it.
-    {$IFDEF WINDOWS}
     OutWrite(LineEnding);
-    {$ELSE}
-    OutWrite(#27'[2J'#27'[H');  // ANSI clear + home
-    {$ENDIF}
     TerminalOutFlush;
   end;
+  {$ENDIF}
+  if (Mode = 1) and TcActive then Exit;   // CLS 1 is the graphics viewport: nothing of the text screen
   ClearView;    // CLS blanks the print area and homes the caret inside it, leaving the area itself set
   FCursorX := 0;
   FCursorY := 0;
@@ -1051,7 +1112,7 @@ begin
   if IsInGraphicsMode then
     FGfxMem.ClearCurrentModeWithIndex(FBgIdx)   // SCNCLR in graphics: clear the viewport to background
   else
-    Clear;                                        // text mode: clear the console
+    ClearMode(Mode);                              // text mode: clear the console
 end;
 
 procedure TTerminalController.SetPixel(X, Y: Integer; RGB: UInt32);
@@ -1448,6 +1509,20 @@ var
   NormalMode: DWORD;
   {$ENDIF}
 begin
+  {$IFDEF UNIX}
+  // ⭐ DIVERGENZE 415: on an initialised terminal the line is EDITED by the runtime, as libfb's
+  // fb_ConReadLine does it - the terminal is in non-canonical mode with no echo for the whole run, so a
+  // plain read would see keys one at a time and show none of them. The line ends as INPUT ends it in fbc.
+  if TcActive then
+  begin
+    if Prompt <> '' then OutWrite(TcPrintText(Prompt));
+    TerminalOutFlush;
+    Result := TcReadLine;
+    if not TcTakeNoNewline then OutWrite(TcPrintText(LineEnding));   // "Input ;" keeps the cursor on the line
+    TerminalOutFlush;
+    Exit;
+  end;
+  {$ENDIF}
   {$IFDEF WINDOWS}
   // Put the console into line-input-with-echo for the duration of THIS read, and restore the mode we
   // found as soon as we are done. The mode belongs to the parent shell: leaving it altered until our
@@ -1522,6 +1597,13 @@ begin
     Result := FPendingChar;
     FHasPendingChar := False;
     FPendingChar := #0;
+    if FPendingTail <> '' then
+    begin
+      // the second byte of a special key is the next character read
+      FPendingChar := FPendingTail[1];
+      Delete(FPendingTail, 1, 1);
+      FHasPendingChar := True;
+    end;
   end
   else
   begin
@@ -1536,9 +1618,7 @@ begin
       Sleep(10);
     until FHasPendingChar;
 
-    Result := FPendingChar;
-    FHasPendingChar := False;
-    FPendingChar := #0;
+    Result := ReadKey;
   end;
 end;
 
@@ -1575,7 +1655,7 @@ begin
   {$IFDEF WINDOWS}
   Result := False;      // a real console can always deliver another key
   {$ELSE}
-  Result := True;
+  Result := not TcActive;   // ...and so can an initialised terminal (DIVERGENZE 415)
   {$ENDIF}
 end;
 
@@ -1583,9 +1663,10 @@ function TTerminalInput.GetLastChar: string;
 begin
   if FHasPendingChar then
   begin
-    Result := FPendingChar;
+    Result := FPendingChar + FPendingTail;
     FHasPendingChar := False;
     FPendingChar := #0;
+    FPendingTail := '';
   end
   else
     Result := '';
@@ -1626,6 +1707,7 @@ var
 {$ENDIF}
 var
   WinCh: Char;
+  KeyStr: string;
 begin
   // ⛔ THE GRAPHICS WINDOW FIRST, AND ON UNIX IT IS THE ONLY SOURCE THERE IS. Everything below this
   // is inside {$IFDEF WINDOWS}, so without this block a Linux build could never report a keypress -
@@ -1641,6 +1723,21 @@ begin
       Exit;
     end;
   end;
+
+  {$IFDEF UNIX}
+  // ⭐ DIVERGENZE 415: the terminal itself, once the console is initialised - libfb's INKEY, special
+  // keys decoded from the terminfo entry into Chr(255) + scan.
+  if not FHasPendingChar and TcActive then
+  begin
+    KeyStr := TcInkey;
+    if KeyStr <> '' then
+    begin
+      FPendingChar := KeyStr[1];
+      FPendingTail := Copy(KeyStr, 2, MaxInt);
+      FHasPendingChar := True;
+    end;
+  end;
+  {$ENDIF}
 
   // Check global CTRL+C flag first
   {$IFDEF WINDOWS}
@@ -1914,6 +2011,7 @@ begin
   FShouldQuit := False;
   FShouldStop := False;
   FPendingChar := #0;
+  FPendingTail := '';
   FHasPendingChar := False;
   {$IFDEF WINDOWS}
   GCtrlCPressed := False;
@@ -1925,6 +2023,7 @@ begin
   // Clear any pending character state
   FHasPendingChar := False;
   FPendingChar := #0;
+  FPendingTail := '';
 end;
 
 procedure TTerminalInput.DisableTextInput;

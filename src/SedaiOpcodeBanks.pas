@@ -806,6 +806,7 @@ begin
     bcGraphicPaint,   // Dest = y coordinate (int) - READ, not written
     bcGraphicGShape,  // Dest = y coordinate (int) - READ, not written
     bcSetColor,       // SETCOLOR: Dest = G component (int) - READ, not written
+    bcConLocate,      // MODERN LOCATE: Dest = cursor flag (int) - READ, when Immediate bit 0 (DIVERGENZE 415)
     // === GROUP 11: Sound ===
     bcSoundSound,     // Dest = duration register (int) - READ, not written
     // === SUPERINSTRUCTIONS ===

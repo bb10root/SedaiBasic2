@@ -70,6 +70,7 @@ uses
   SedaiExecutorContext, SedaiExecutorTypes, SedaiOutputInterface,
   // I/O Manager
   SedaiIOManager, SedaiTerminalIO, SedaiConsoleState,
+  SedaiTermConsole,   // the console on a terminal, as libfb has it (DIVERGENZE 415): started only here, never by sbv
   // Optional SDL2 window presenter for `sb --window` (WITH_WINDOW build only; no SDL2 dependency otherwise)
   {$IFDEF WITH_WINDOW}SedaiGraphicsBackend, SedaiWindowPresenter,{$ENDIF}
   // Runner and Serializer (for .basc support)
@@ -2065,6 +2066,10 @@ begin
       Output := GTermCtrl;   // keep a concrete handle so --window can attach the shared graphics surface
       Input := TTerminalInput.Create;
       Output.Initialize('SedaiBasic', 80, 25);
+      // ⭐ DIVERGENZE 415: the program runs on a terminal as under fbc - keys without Enter, COLOR/LOCATE/
+      // CLS written to it, CSRLIN/POS asked of it, the terminal put back at exit. Before the VM exists,
+      // which reads TcActive for its console colours. Only when fbc's runtime would initialise.
+      TcStart;
       VM := TBytecodeVM.Create;
       WireFileHandler(VM);
     {$IFDEF ENABLE_PROFILER}
@@ -2471,6 +2476,10 @@ begin
       Output := GTermCtrl;   // keep a concrete handle so --window can attach the shared graphics surface
       Input := TTerminalInput.Create;
       Output.Initialize('SedaiBasic', 80, 25);
+      // ⭐ DIVERGENZE 415: the program runs on a terminal as under fbc - keys without Enter, COLOR/LOCATE/
+      // CLS written to it, CSRLIN/POS asked of it, the terminal put back at exit. Before the VM exists,
+      // which reads TcActive for its console colours. Only when fbc's runtime would initialise.
+      TcStart;
       VM := TBytecodeVM.Create;
       WireFileHandler(VM);
       {$IFDEF ENABLE_PROFILER}

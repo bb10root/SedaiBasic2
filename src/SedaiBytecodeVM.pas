@@ -555,6 +555,9 @@ type
     // line read last, and the position of the next field in it. Exhausted = read another line.
     FConInBuf: string;
     FConInPos: Integer;
+    // the first INPUT of a MODERN statement says what fbc writes around it (DIVERGENZE 415): bit 0 no new line after
+    // Enter (a leading ';'), bit 1 the "? " is decided, bit 2 it is written. Read by the next console line, then 0.
+    FConInFlags: Integer;
     FEnvOverrides: TStringList; // SETENVIRON "NAME=value" overrides, consulted by ENVIRON$ before the OS environment
     // FreeBASIC DIR: ONE directory walk is open at a time, exactly as in fbc - "Dir(spec, mask)" starts
     // it, "Dir()" steps it, and it ends when the entries run out (fbc has no handle to close). The
@@ -738,6 +741,7 @@ type
     procedure RecomputeGfxWindow;            // rebuild the WINDOW coefficients against the current viewport
     function DrawSurface: Integer;           // FreeBASIC per-statement image draw target (else the work page)
     function NextConsoleField: string;
+    function ConsoleQuestion(const Default: string): string;   // INPUT's "? " and new line (DIVERGENZE 415)
     function NextConsoleLine: string;     // LINE INPUT: the whole line (DIVERGENZE 646)             // MODERN INPUT: the next field of the stdin stream
     procedure SetupGfxScreen(W, H, NumPages: Integer; Depth: Integer = 0);  // SCREENRES/SCREEN: resize + (re)build pages
     // Group-specific dispatch handlers
@@ -1236,6 +1240,7 @@ uses
   // TARGET, which is the same shape that let every Windows build die once before (see the PowerShell
   // scripts, 2 Sep). A diagnostic knob is not worth an unbuildable target.
   SedaiTerminalIO,
+  SedaiTermConsole,     // the console on a terminal, as libfb has it (DIVERGENZE 415)
   SedaiCStdio,          // PRINT's bytes live in C's stdout: flushed before C runs (DIVERGENZE 434)
   SedaiFbDate,          // DATEADD/DATEDIFF/DATEPART as fbc's runtime answers them
   SedaiFbFormat,        // FORMAT, likewise
@@ -1952,6 +1957,8 @@ begin
   // that caught it reads Color() before issuing any COLOR at all, so it measures exactly this value.
   FConColorFg := 0;
   FConColorBg := 0;
+  // ...unless the console on a terminal is initialised: libfb starts it white on black (DIVERGENZE 415)
+  if TcActive then FConColorFg := 7;
   // FreeBASIC page flipping: single page (the screen) until SCREENRES requests more.
   FGfxWorkSurface := GFX_SCREEN_SURFACE;
   FGfxWorkPage := 0;
@@ -12365,6 +12372,7 @@ procedure TBytecodeVM.ExecuteInstruction(Ctx: TExecutionContext; const Instr: TB
 var
   Group: Word;
   SleepMs: Integer;
+  SleepWake: Boolean;   // SLEEP wakes on a key (DIVERGENZE 415)
   FrameFPS, FrameTimeMs, WaitMs, ChunkMs: Integer;
   NowTick, TargetTick: QWord;
   KeyNum, KeyIdx, CharIdx: Integer;
@@ -12802,12 +12810,26 @@ begin
         // "Sleep" (no argument) waits for a keypress in FB — headless there is none, so approximate with a
         // short fixed wait. (The sleep duration never affects program OUTPUT, which is deterministic, so
         // this only changes wall-clock time — but treating ms as seconds made "Sleep 100" hang ~100 s.)
-        if Instr.Immediate > 0 then
-          SleepMs := Instr.Immediate
+        // ⭐ DIVERGENZE 415: Immediate -1 is a bare MODERN "Sleep" (wait for a key), and bit 40 is the
+        // "Sleep n, 1" flag (do not wake on a key); the milliseconds are in the low 40 bits.
+        SleepWake := (Instr.Immediate < 0) or ((Instr.Immediate shr 40) and 1 = 0);
+        if Instr.Immediate = -1 then
+          SleepMs := -1
+        else if (Instr.Immediate and $FFFFFFFFFF) > 0 then
+          SleepMs := Instr.Immediate and $FFFFFFFFFF
         else if Instr.Src1 < Ctx.FloatRegCount then
           SleepMs := Trunc(Ctx.FloatRegs[Instr.Src1])
         else
           SleepMs := 1000;
+        // On an initialised terminal SLEEP is libfb's: -1 waits for a key, 100 ms or more wakes on one.
+        if TcActive and not Assigned(FEventPollCallback) then
+        begin
+          if SleepMs < -1 then SleepMs := 0;
+          if SleepMs > 65535000 then SleepMs := 65535000;
+          TcSleep(SleepMs, SleepWake);
+          SleepMs := 0;
+        end;
+        if SleepMs = -1 then SleepMs := 1;   // ...and with no terminal there is no key to wait for
         if SleepMs < 0 then SleepMs := 0;
         if SleepMs > 65535000 then SleepMs := 65535000;
         while (SleepMs > 0) and Ctx.Running do
@@ -13283,6 +13305,9 @@ begin
               KeyStr := '';
               if Ctx.Running and FInputDevice.HasChar then KeyStr := FInputDevice.GetLastChar;
               if KeyStr = '' then Ctx.IntRegs[Instr.Dest] := -1
+              // a special key is Chr(255) + scan as INKEY spells it, and (scan shl 8) or 255 as GETKEY
+              // answers it (DIVERGENZE 415)
+              else if Length(KeyStr) >= 2 then Ctx.IntRegs[Instr.Dest] := (Ord(KeyStr[2]) shl 8) or Ord(KeyStr[1])
               else Ctx.IntRegs[Instr.Dest] := Ord(KeyStr[1]);
             end
             else if Ctx.Running then
@@ -20219,6 +20244,21 @@ begin
     Ctx.CursorCol := Ctx.CursorCol mod FConsoleBehavior.ScreenCols;
 end;
 
+// An INPUT instruction's Immediate: the code it always carried (-1 / INPUT_LINE_PROMPT / INPUT_LINE / 0) in the low 32
+// bits, and - only when bits 40..63 hold the marker $100 - the flags of FConInFlags in bits 32..39 (DIVERGENZE 415).
+// An older .basc has no marker and reads as it always did.
+function InputCode(const I: TBytecodeInstruction): Int64; inline;
+begin
+  if ((QWord(I.Immediate) shr 32) and $FFFFFF00) = $100 then Result := Int32(I.Immediate and $FFFFFFFF)
+  else Result := I.Immediate;
+end;
+
+function InputFlags(const I: TBytecodeInstruction): Integer; inline;
+begin
+  if ((QWord(I.Immediate) shr 32) and $FFFFFF00) = $100 then Result := (QWord(I.Immediate) shr 32) and $FF
+  else Result := 0;
+end;
+
 procedure TBytecodeVM.ExecuteIOOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
@@ -20247,6 +20287,8 @@ begin
   // ⭐ A WIDE TAIL survives only the separators that belong to the item (comma, semicolon, TAB, SPC, line
   // break: sub-ops 6..10). Any other I/O op - a narrow item, PRINT END, INPUT - closes it (DIVERGENZE 414).
   if FPrintWideTail and not ((SubOp >= 6) and (SubOp <= 10)) then FPrintWideTail := False;
+  // an INPUT instruction says what is written around the line it reads (DIVERGENZE 415; 0 for every other)
+  if (SubOp >= 12) and (SubOp <= 15) then FConInFlags := InputFlags(Instr);
   case SubOp of
     0: // bcPrint (float). Immediate = 1 when the value is SINGLE-typed: print it with a SINGLE's
        // 7 significant digits, which is what hides its representation error (8.300000190734863 -> "8.3").
@@ -20492,7 +20534,7 @@ begin
         if Assigned(FOutputDevice) and
            (GStdinIsTerminal or not (Assigned(FProgram) and FProgram.ModernMode)) then
         begin
-          if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
+          if ((InputCode(Instr) = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
             FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
         end;
         repeat
@@ -20515,7 +20557,7 @@ begin
             FOutputDevice.Print('?REDO FROM START');
             FOutputDevice.NewLine;
             // Reprint prompt for retry
-            if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
+            if ((InputCode(Instr) = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
               FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
           end;
         until False;
@@ -20528,7 +20570,7 @@ begin
         if Assigned(FOutputDevice) and
            (GStdinIsTerminal or not (Assigned(FProgram) and FProgram.ModernMode)) then
         begin
-          if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
+          if ((InputCode(Instr) = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
             FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
         end;
         // ⭐⭐ MODERN NEVER REFUSES AN INPUT. fbc parses what it can and leaves 0 for the rest - there
@@ -20581,7 +20623,7 @@ begin
               FOutputDevice.Print('?REDO FROM START');
               FOutputDevice.NewLine;
               // Reprint prompt for retry
-              if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
+              if ((InputCode(Instr) = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
                 FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
             end;
           end
@@ -20590,7 +20632,7 @@ begin
             FOutputDevice.Print('?REDO FROM START');
             FOutputDevice.NewLine;
             // Reprint prompt for retry
-            if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
+            if ((InputCode(Instr) = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
               FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
           end;
         until False;
@@ -20603,7 +20645,7 @@ begin
         if Assigned(FOutputDevice) and
            (GStdinIsTerminal or not (Assigned(FProgram) and FProgram.ModernMode)) then
         begin
-          if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
+          if ((InputCode(Instr) = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
             FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
         end;
         // ⭐ MODERN never refuses - see the integer arm above.
@@ -20640,7 +20682,7 @@ begin
             FOutputDevice.Print('?REDO FROM START');
             FOutputDevice.NewLine;
             // Reprint prompt for retry
-            if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
+            if ((InputCode(Instr) = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
               FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
           end;
         until False;
@@ -20652,7 +20694,7 @@ begin
         if Assigned(FOutputDevice) and
            (GStdinIsTerminal or not (Assigned(FProgram) and FProgram.ModernMode)) then
         begin
-          if ((Instr.Immediate = -1) or (Instr.Immediate = INPUT_LINE_PROMPT) or (Instr.Src1 > 0)) and
+          if ((InputCode(Instr) = -1) or (InputCode(Instr) = INPUT_LINE_PROMPT) or (Instr.Src1 > 0)) and
              (Instr.Src1 < Length(Ctx.StringRegs)) then
             FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
         end;
@@ -20661,7 +20703,7 @@ begin
         // ⭐ ...and LINE INPUT takes the WHOLE line, commas included (DIVERGENZE 646): the rest of a line an INPUT left
         // half read, else the next one.
         if Assigned(FProgram) and FProgram.ModernMode and
-           ((Instr.Immediate = INPUT_LINE_PROMPT) or (Instr.Immediate = INPUT_LINE)) then
+           ((InputCode(Instr) = INPUT_LINE_PROMPT) or (InputCode(Instr) = INPUT_LINE)) then
           Ctx.StringRegs[Instr.Dest] := NextConsoleLine
         else if Assigned(FProgram) and FProgram.ModernMode then
           Ctx.StringRegs[Instr.Dest] := NextConsoleField
@@ -20700,7 +20742,19 @@ begin
       // Every argument is optional ("Declare Function Locate( row As Long = 0, column As Long = 0, ... )"),
       // and the default 0 means LEAVE THAT COORDINATE ALONE -- "Locate 10" moves to row 10 and keeps the
       // column. We required both and rejected the one-argument form outright.
-      if Assigned(FOutputDevice) then
+      // ⭐ DIVERGENZE 415: on an initialised terminal LOCATE is libfb's - an omitted coordinate is ASKED
+      // of the terminal, the move and the cursor visibility (third argument: Dest, flagged by Immediate
+      // bit 0) are written to it - and the modelled screen follows where it landed.
+      if TcActive and not FGfxFBScreen then
+      begin
+        if (Instr.Immediate and 1) <> 0 then
+          TcLocate(Integer(Ctx.IntRegs[Instr.Src1]), Integer(Ctx.IntRegs[Instr.Src2]),
+                   Integer(Ctx.IntRegs[Instr.Dest]), ScreenRow, ScreenCol)
+        else
+          TcLocate(Integer(Ctx.IntRegs[Instr.Src1]), Integer(Ctx.IntRegs[Instr.Src2]), -1, ScreenRow, ScreenCol);
+        if Assigned(FOutputDevice) then FOutputDevice.SetCursor(ScreenCol - 1, ScreenRow - 1);
+      end
+      else if Assigned(FOutputDevice) then
       begin
         ScreenRow := Integer(Ctx.IntRegs[Instr.Src1]);
         ScreenCol := Integer(Ctx.IntRegs[Instr.Src2]);
@@ -20713,6 +20767,8 @@ begin
       begin
         ScreenRow := Integer(Ctx.IntRegs[Instr.Src1]);   // first row, 1-based (0 = whole screen)
         ScreenCol := Integer(Ctx.IntRegs[Instr.Src2]);   // last row, 1-based
+        // ⭐ DIVERGENZE 415: on an initialised terminal the area is the terminal's scroll region, as libfb sets it
+        if TcActive then TcViewPrint(ScreenRow, ScreenCol);
         if (ScreenRow <= 0) or (ScreenCol <= 0) then
         begin
           ScreenRow := 1;
@@ -20739,6 +20795,7 @@ var
   TimeTargetMs, TimeCurrentMs: Int64;
   TimeCH, TimeCM, TimeCS, TimeCMS: Word;
   DateY, DateM, DateD: Word;
+  TermCol, TermRow: Integer;   // CSRLIN asked of the terminal (DIVERGENZE 415)
 begin
   SubOp := Instr.OpCode and $FF;
   case SubOp of
@@ -20821,7 +20878,13 @@ begin
     11: // bcCsrlin - return current text cursor row (VM-tracked, parallels POS/CursorCol)
       // ⛔ ONE-BASED IN MODERN, for the same reason POS is: the manual says "The topmost row is
       // number 1". CLASSIC keeps the Commodore numbering.
-      if Assigned(FProgram) and FProgram.ModernMode then
+      // ⭐ DIVERGENZE 415: on an initialised terminal, libfb ASKS THE TERMINAL on every call.
+      if Assigned(FProgram) and FProgram.ModernMode and TcActive and not FGfxFBScreen then
+      begin
+        TcGetXY(TermCol, TermRow);
+        Ctx.IntRegs[Instr.Dest] := TermRow;
+      end
+      else if Assigned(FProgram) and FProgram.ModernMode then
         Ctx.IntRegs[Instr.Dest] := Ctx.CursorRow + 1
       else
         Ctx.IntRegs[Instr.Dest] := Ctx.CursorRow;
@@ -20836,6 +20899,20 @@ begin
   end;
 end;
 
+function TBytecodeVM.ConsoleQuestion(const Default: string): string;
+// What INPUT writes after the prompt: as the statement said (FConInFlags), else Default - and nothing at all when
+// stdin is not a terminal (fbc writes no prompt there).
+begin
+  if not GStdinIsTerminal then Result := ''
+  else if (FConInFlags and 2) <> 0 then
+  begin
+    if (FConInFlags and 4) <> 0 then Result := '? ' else Result := '';
+  end
+  else Result := Default;
+  if (FConInFlags and 1) <> 0 then TcNoNewlineOnce;
+  FConInFlags := 0;
+end;
+
 function TBytecodeVM.NextConsoleLine: string;
 // LINE INPUT from the console (DIVERGENZE 646): the rest of the line an INPUT left half read, else the next line, whole -
 // commas are text here, not field separators. Shares the buffer with NextConsoleField, so the two interleave as fbc's do.
@@ -20844,9 +20921,10 @@ begin
   begin
     Result := Copy(FConInBuf, FConInPos, MaxInt);
     FConInPos := Length(FConInBuf) + 1;
+    FConInFlags := 0;
     Exit;
   end;
-  Result := FInputDevice.ReadLine('', False, False, True);
+  Result := FInputDevice.ReadLine(ConsoleQuestion(''), False, False, True);
   FConInBuf := '';
   FConInPos := 0;
 end;
@@ -20864,12 +20942,10 @@ begin
   // would answer an empty field before reading anything.
   if (FConInPos < 1) or (FConInPos > Length(FConInBuf)) then
   begin
-    if GStdinIsTerminal then
-      FConInBuf := FInputDevice.ReadLine('? ', False, False, True)
-    else
-      FConInBuf := FInputDevice.ReadLine('', False, False, True);
+    FConInBuf := FInputDevice.ReadLine(ConsoleQuestion('? '), False, False, True);
     FConInPos := 1;
   end;
+  FConInFlags := 0;
   Result := NextInputField(FConInBuf, FConInPos);
 end;
 
@@ -21017,6 +21093,7 @@ end;
 procedure TBytecodeVM.ExecuteGraphicsOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
+  TermCol, TermRow: Integer;   // POS asked of the terminal (DIVERGENZE 415)
   DrawMode: Integer;
   PalColor: UInt32;
   GetX1, GetY1, GetX2, GetY2, GetSx, GetSy, SwapTmp: Integer;
@@ -21225,7 +21302,12 @@ begin
         // outright for rows: "The topmost row is number 1"), and we answered 0 - so every FreeBASIC
         // program reading POS was off by one, silently. Commodore counts from 0 and CLASSIC keeps it:
         // the two dialects number their columns differently and they stay apart.
-        if Assigned(FProgram) and FProgram.ModernMode then
+        if Assigned(FProgram) and FProgram.ModernMode and TcActive and not FGfxFBScreen then
+        begin
+          TcGetXY(TermCol, TermRow);   // DIVERGENZE 415: asked of the terminal
+          Ctx.IntRegs[Instr.Dest] := TermCol;
+        end
+        else if Assigned(FProgram) and FProgram.ModernMode then
           Ctx.IntRegs[Instr.Dest] := Ctx.CursorCol + 1
         else
           Ctx.IntRegs[Instr.Dest] := Ctx.CursorCol;
@@ -21484,6 +21566,15 @@ begin
         begin FGfxForeColor := UInt32(Ctx.IntRegs[Instr.Src1]); FConColorFg := Ctx.IntRegs[Instr.Src1]; end;
         if (Instr.Immediate and 2) <> 0 then
         begin FGfxBackColor := UInt32(Ctx.IntRegs[Instr.Src2]); FConColorBg := Ctx.IntRegs[Instr.Src2]; end;
+        // ⭐ DIVERGENZE 415: on an initialised terminal, and outside a graphics screen, the colour is
+        // written to the terminal and kept as libfb keeps it (four bits each).
+        if TcActive and not FGfxFBScreen then
+        begin
+          TcColor(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+                  (Instr.Immediate and 1) <> 0, (Instr.Immediate and 2) <> 0);
+          FConColorFg := TcColorFg;
+          FConColorBg := TcColorBg;
+        end;
         // Leave them on the backend as well: inside a graphics mode PRINT draws with these, and the
         // text device reads them from there. It is the only place both can reach - see SetTextColors.
         if Assigned(FGraphics) then
@@ -21496,6 +21587,9 @@ begin
         1: Ctx.IntRegs[Instr.Dest] := Int64(FGfxBackColor);
         2: Ctx.IntRegs[Instr.Dest] := FConColorFg;
         3: Ctx.IntRegs[Instr.Dest] := FConColorBg;
+        // 4: LOCATE()'s visibility bit - the cursor is shown unless LOCATE hid it on a terminal (DIVERGENZE 415)
+        4: if TcActive and not TcCursorVisible then Ctx.IntRegs[Instr.Dest] := 0
+           else Ctx.IntRegs[Instr.Dest] := $10000;
       else
         Ctx.IntRegs[Instr.Dest] := Int64(FGfxForeColor);
       end;
@@ -24126,7 +24220,13 @@ begin
     if ComSpec = '' then ComSpec := 'cmd.exe';
     Result := ExecuteProcess(ComSpec, ['/C', Cmd], []);
     {$ELSE}
-    Result := ExecuteProcess('/bin/sh', ['-c', Cmd], []);
+    // the child sees the terminal as the user left it, as libfb does around SHELL (DIVERGENZE 415)
+    TcSuspend;
+    try
+      Result := ExecuteProcess('/bin/sh', ['-c', Cmd], []);
+    finally
+      TcResume;
+    end;
     {$ENDIF}
   except
     on E: Exception do Result := -1;   // shell not found / launch failure

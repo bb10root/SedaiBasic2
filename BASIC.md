@@ -530,6 +530,11 @@ raw bytes.
   supply. Where fbc accepts the statement, the result is byte-identical: the destination's current
   length is preserved, the source is cut from the right when longer and padded when shorter, and the
   counts are codepoints for a wide destination.
+- ⚠️ **`LSet` between two records with `String` fields copies the strings, not the bytes.** FreeBASIC documents the
+  UDT form as a byte-for-byte copy, so under `fbc` the two `String` fields end up sharing one buffer: writing the
+  source afterwards changes the destination, and the program fails at exit with a double free. Here a `String`
+  field is copied as an assignment copies it, so each record keeps its own bytes; plain fields are overlaid exactly
+  as in FreeBASIC.
 - **Overload resolution ranks the implicit conversions, as FreeBASIC does.** All twelve numeric types
   are told apart, the four 64-bit names (`Integer`, `LongInt`, `UInteger`, `ULongInt`) included, and a
   call whose argument matches no candidate exactly takes the cheapest conversion rather than the first
@@ -691,12 +696,28 @@ raw bytes.
   mode is up, to emulate QB's VGA palette — those three are not hardware. The manual calls that use
   deprecated and no example in the FreeBASIC distribution uses it; the measured protocol is written
   out in the project's own probe corpus, so implementing it later needs no new measurement.
-- ⚠️ **Keyboard input on the headless Linux build**: `TTerminalInput.ProcessEvents` is implemented for
-  Windows only, so under `sb` on Unix no key can ever reach `INKEY` / `GETKEY` from a real terminal.
-  ⭐ This is *not* observable as a divergence — fbc's `INKEY` reads the console, not stdin, so with
-  input redirected both engines answer the empty string, and at EOF both answer `-1` from `GETKEY`.
-  It is a platform gap found by reading the code, recorded here rather than left to be rediscovered
-  as a freeze. `IInputDevice.InputExhausted` is what stops a blocking read from spinning for ever.
+- ⭐ **The console on a Linux terminal is FreeBASIC's.** When standard input and output are both a terminal, the
+  program is in the foreground and `TERM` names a terminfo entry, `sb` sets the terminal up as FreeBASIC's runtime
+  does, and puts it back at exit, on Ctrl+C and around `SHELL`. In that state:
+  - **keys:** `INKEY` and `GETKEY` get keys without Enter, special keys as `Chr(255)` + scan code (`GETKEY`:
+    `scan * 256 + 255`); a bare `SLEEP` waits for a key, and `SLEEP n` of 100 ms or more wakes on one unless the
+    second argument is 1;
+  - **line input:** `INPUT` and `LINE INPUT` edit the line (Backspace, Left/Right, Home/End, Del, Esc, Tab), and write
+    `? ` after a prompt followed by `;`, not after one followed by `,`; a leading `;` keeps the cursor on the line;
+  - **screen:** `COLOR`, `LOCATE` (and its cursor-visibility argument), `CLS`, `VIEW PRINT` (the scroll region) are
+    written to the terminal; `CSRLIN`, `POS` and `LOCATE()` ask the terminal where the cursor is; a printed control
+    character the terminal would obey (BS, FF, SO, SI, ESC) prints as a glyph, as in FreeBASIC.
+
+  With input or output redirected, none of this happens — in FreeBASIC either — and `CLS` writes nothing.
+  `SB_TERMCONSOLE=0` turns it all off. Not yet: `GETMOUSE` and `MULTIKEY` on a terminal.
+
+  Three differences are kept on purpose, because what FreeBASIC does is a defect:
+  - a terminal that never answers the cursor-position question makes a FreeBASIC program hang for ever before its
+    first line; here the wait is one second, after which the runtime's own count answers and the terminal is not
+    asked again;
+  - Ctrl+Z gives the shell back a working terminal while the program is stopped (FreeBASIC leaves it without echo),
+    and a Ctrl+C the shell told the program to ignore stays ignored;
+  - the padding delays of very old terminals (`$<n>` in terminfo) are not sent as NUL bytes.
 - ⛔ **`OPEN PIPE` is not implemented** (neither the statement nor the function form). fbc runs the
   command and binds its stdout/stdin to the handle; we refuse it at the parser. `OPEN CONS`,
   `OPEN SCRN` and `OPEN ERR` all work, with or without the `FOR` clause, and `SHELL`'s exit code

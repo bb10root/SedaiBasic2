@@ -2178,6 +2178,18 @@ begin
   else if Instr.Src3.Kind = svkConstFloat then
     BCInstr.Immediate := Trunc(Instr.Src3.ConstFloat);
 
+  // MODERN LOCATE's cursor flag (DIVERGENZE 415): a register READ through Dest, Immediate bit 0 says it is
+  // there - an older .basc carries Immediate 0 and no flag. SedaiOpcodeBanks.DestReadIsIntReg knows it.
+  if Instr.OpCode = ssaConLocate then
+  begin
+    if Instr.Src3.Kind = svkRegister then
+    begin
+      BCInstr.Dest := MapSSARegisterToBytecode(Instr.Src3.RegType, Instr.Src3.RegIndex, Instr.Src3.Version);
+      BCInstr.Immediate := 1;
+    end
+    else
+      BCInstr.Immediate := 0;
+  end;
   // ssaRecordNew (M3): the three operands are compile-time slot counts (int/float/string),
   // not registers. Override the generic mapping so they land in Src1/Src2/Immediate directly
   // (Dest stays the mapped handle register).
